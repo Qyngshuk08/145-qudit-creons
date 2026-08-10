@@ -1,0 +1,9 @@
+Evaluation @ risk_score threshold=30
+Fraud accounts in ground truth (excl. external nodes): 643
+Accounts flagged by detector: 190
+True Positives:  81
+False Positives: 109
+False Negatives: 562
+Precision: 0.426
+Recall:    0.126
+F1:        0.194
