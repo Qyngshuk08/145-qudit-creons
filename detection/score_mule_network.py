@@ -33,8 +33,44 @@ OUT_DIR = os.path.join(_PROJECT_ROOT, "detection")  # writes scores/report here
 # ---------------------------------------------------------------------------
 # 1. Load data & build directed multigraph
 # ---------------------------------------------------------------------------
+GRAPH_DB_PATH = os.path.join(_PROJECT_ROOT, "graph", "mule_graph_db")
+
+
 def load_and_build_graph():
-    txns = pd.read_csv(f"{IN_DIR}/transactions.csv", parse_dates=["timestamp"])
+    """Load transactions from KuzuDB (not raw CSV) -- this is now the single
+    source of truth for detection. accounts.csv/ground_truth.csv are still
+    read directly for account metadata and evaluation (those aren't part of
+    the graph itself). Run graph/build_graph_db.py first if this errors with
+    'no database found'.
+    """
+    import kuzu
+
+    if not os.path.exists(GRAPH_DB_PATH):
+        raise FileNotFoundError(
+            f"No KuzuDB database at {GRAPH_DB_PATH}. Run graph/build_graph_db.py first."
+        )
+
+    db = kuzu.Database(GRAPH_DB_PATH)
+    conn = kuzu.Connection(db)
+
+    rows = []
+    # Pull all three endpoint-type combinations (matches how build_graph_db.py
+    # split the load) and recombine into one flat table, same shape as the
+    # original transactions.csv, so every detector below is unchanged.
+    queries = [
+        "MATCH (a:Account)-[t:TRANSACTION]->(b:Account) RETURN a.account_id, b.account_id, t.transaction_id, t.amount, t.timestamp, t.category",
+        "MATCH (a:Account)-[t:TRANSACTION]->(b:ExternalEntity) RETURN a.account_id, b.entity_id, t.transaction_id, t.amount, t.timestamp, t.category",
+        "MATCH (a:ExternalEntity)-[t:TRANSACTION]->(b:Account) RETURN a.entity_id, b.account_id, t.transaction_id, t.amount, t.timestamp, t.category",
+    ]
+    for q in queries:
+        result = conn.execute(q)
+        while result.has_next():
+            rows.append(result.get_next())
+
+    txns = pd.DataFrame(rows, columns=["src_account", "dst_account", "transaction_id", "amount", "timestamp", "category"])
+    txns["timestamp"] = pd.to_datetime(txns["timestamp"])
+    print(f"Loaded {len(txns)} transactions from KuzuDB (source of truth: graph/mule_graph_db)")
+
     G = nx.MultiDiGraph()
     for _, r in txns.iterrows():
         G.add_edge(
@@ -135,46 +171,58 @@ def detect_rapid_passthrough(G, txns, max_gap_hours=2, min_ratio=0.85):
     return flags
 
 
-def detect_layering_chains(G, min_chain_length=3, max_hop_hours=2, max_starts_per_node=5):
-    """Find short directed paths of rapid sequential P2P transfers (A->B->C->D).
+def detect_layering_chains(G, min_chain_length=3, max_hop_hours=2, max_starts_per_node=8, max_branches=3):
+    """Find directed paths of rapid sequential P2P transfers (A->B->C->D...).
 
-    Restricted to category == 'transfer_p2p' edges: merchant/utility payments
-    are not part of layering behavior and were drowning out the real chains
-    when the walker tried arbitrary edges. We also try several candidate
-    start edges per node (not just the earliest) since a node's first
-    outbound transaction of the day is usually a normal payment, not fraud.
+    v2: bounded depth-first search with backtracking, instead of a single
+    greedy nearest-edge walk. The v1 walker picked one "next hop" per node
+    and gave up if it was wrong -- with thousands of normal P2P transfers
+    as noise, one wrong pick anywhere in the chain lost the whole thing.
+    This version tries up to `max_branches` candidate next-hops at each
+    step and backtracks on dead ends, which is what actually finds chains
+    buried in noisy traffic. Still restricted to transfer_p2p edges and
+    still bounded (not full path enumeration) to stay tractable on ~5.5k
+    nodes / ~120k edges.
     """
     flags = defaultdict(lambda: {"score": 0, "reasons": []})
+    found_chains = []
+
+    def dfs(path, last_time, depth, budget):
+        """path: list of account_ids visited so far. Returns True if a
+        long-enough chain was found along this branch (for early stop)."""
+        if depth >= min_chain_length:
+            found_chains.append(list(path))
+            return True
+        if budget <= 0:
+            return False
+        current = path[-1]
+        next_edges = sorted(
+            [(u, v, d) for u, v, d in G.out_edges(current, data=True)
+             if d["category"] == "transfer_p2p" and
+             d["timestamp"] > last_time and
+             d["timestamp"] <= last_time + pd.Timedelta(hours=max_hop_hours) and
+             v not in path],
+            key=lambda e: e[2]["timestamp"]
+        )[:max_branches]
+        for _, v, d in next_edges:
+            if dfs(path + [v], d["timestamp"], depth + 1, budget - 1):
+                return True  # one valid chain from this start is enough
+        return False
+
     for node in G.nodes():
         out_edges = sorted(
             [(u, v, d) for u, v, d in G.out_edges(node, data=True) if d["category"] == "transfer_p2p"],
             key=lambda e: e[2]["timestamp"]
-        )
-        for _, first_dst, first_data in out_edges[:max_starts_per_node]:
-            chain = [node, first_dst]
-            last_time = first_data["timestamp"]
-            current = first_dst
-            for _ in range(min_chain_length):
-                next_edges = [
-                    (u, v, d) for u, v, d in G.out_edges(current, data=True)
-                    if d["category"] == "transfer_p2p" and
-                    d["timestamp"] > last_time and
-                    d["timestamp"] <= last_time + pd.Timedelta(hours=max_hop_hours)
-                ]
-                if not next_edges:
-                    break
-                u, v, d = sorted(next_edges, key=lambda e: e[2]["timestamp"])[0]
-                if v in chain:
-                    break
-                chain.append(v)
-                last_time = d["timestamp"]
-                current = v
-            if len(chain) >= min_chain_length + 1:
-                for acct in chain:
-                    flags[acct]["score"] = max(flags[acct]["score"], 30)
-                    flags[acct]["reasons"].append(
-                        f"layering_chain: part of {len(chain)}-hop rapid P2P transfer chain"
-                    )
+        )[:max_starts_per_node]
+        for _, first_dst, first_data in out_edges:
+            dfs([node, first_dst], first_data["timestamp"], 1, budget=200)
+
+    for chain in found_chains:
+        for acct in chain:
+            flags[acct]["score"] = max(flags[acct]["score"], 30)
+            flags[acct]["reasons"].append(
+                f"layering_chain: part of {len(chain)}-hop rapid P2P transfer chain"
+            )
     return flags
 
 
