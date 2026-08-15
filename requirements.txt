@@ -2,3 +2,7 @@ networkx
 pandas
 numpy
 faker
+kuzu
+openai
+fastapi
+uvicorn
