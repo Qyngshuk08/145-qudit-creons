@@ -6,3 +6,4 @@ kuzu
 openai
 fastapi
 uvicorn
+langgraph

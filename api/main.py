@@ -190,3 +190,33 @@ def explain_account_endpoint(account_id: str):
             status_code=502,
             detail=f"Explanation generation failed ({e}). Raw evidence: {risk_info['evidence']}"
         )
+
+
+@app.get("/accounts/{account_id}/investigate")
+def investigate_account_endpoint(account_id: str):
+    """Runs the LangGraph investigation agent, reusing this process's
+    already-open KuzuDB connection (_state["conn"]) rather than opening a
+    second one -- avoids KuzuDB's single-process lock conflict that occurs
+    if the standalone agent script is run while this API is also running."""
+    from agents.investigation_agent import fetch_account, check_network_risk, decide_action, generate_narrative
+
+    state = {
+        "account_id": account_id, "risk_score": 0, "triggered_patterns": "",
+        "evidence": "", "flagged_counterparties": [], "recommended_action": "", "narrative": "",
+    }
+    try:
+        state = fetch_account(state)
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"Account {account_id} not found in risk scores")
+
+    state = check_network_risk(state, conn=_state["conn"])  # reuse the API's open connection
+    state = decide_action(state)
+    state = generate_narrative(state)
+
+    return {
+        "account_id": state["account_id"],
+        "risk_score": state["risk_score"],
+        "flagged_counterparties": state["flagged_counterparties"],
+        "recommended_action": state["recommended_action"],
+        "narrative": state["narrative"],
+    }
