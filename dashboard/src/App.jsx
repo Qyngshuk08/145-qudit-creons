@@ -39,6 +39,48 @@ function AccountList({ accounts, selectedId, onSelect, loading, error }) {
   )
 }
 
+function ExplainPanel({ accountId }) {
+  const [state, setState] = useState({ status: 'idle', text: null, source: null })
+
+  // Reset when the selected account changes -- don't show a stale explanation
+  useEffect(() => {
+    setState({ status: 'idle', text: null, source: null })
+  }, [accountId])
+
+  const fetchExplanation = () => {
+    setState({ status: 'loading', text: null, source: null })
+    fetch(`${API_BASE}/accounts/${accountId}/explain`)
+      .then(async (r) => {
+        const data = await r.json()
+        if (!r.ok) throw new Error(data.detail || `API returned ${r.status}`)
+        return data
+      })
+      .then((data) => setState({ status: 'done', text: data.explanation, source: data.source }))
+      .catch((e) => setState({ status: 'error', text: e.message, source: null }))
+  }
+
+  return (
+    <div className="detail-section explain-section">
+      <h3>
+        Investigator Explanation
+        {state.source && (
+          <span className={`source-tag ${state.source.startsWith('live') ? 'live' : ''}`}>
+            {state.source}
+          </span>
+        )}
+      </h3>
+      {state.status === 'idle' && (
+        <button className="explain-button" onClick={fetchExplanation}>
+          Generate explanation (Nemotron)
+        </button>
+      )}
+      {state.status === 'loading' && <p className="evidence-text loading">Generating narrative...</p>}
+      {state.status === 'error' && <p className="evidence-text error-text">{state.text}</p>}
+      {state.status === 'done' && <p className="evidence-text explanation-text">{state.text}</p>}
+    </div>
+  )
+}
+
 function AccountDetail({ accountId }) {
   const [detail, setDetail] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -87,6 +129,8 @@ function AccountDetail({ accountId }) {
         <h3>Evidence <span className="source-tag">precomputed</span></h3>
         <p className="evidence-text">{detail.evidence}</p>
       </div>
+
+      <ExplainPanel accountId={detail.account_id} />
 
       <div className="detail-section">
         <h3>Recent Incoming <span className="source-tag live">live &middot; KuzuDB</span></h3>
