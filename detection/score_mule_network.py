@@ -140,7 +140,12 @@ def detect_fan_in(G, txns, window_minutes=400, min_senders=4, cashout_window_hou
                 # feeder accounts are lower-confidence individually (could be
                 # coincidental) but still worth a moderate flag for review
                 for feeder in window["src_account"].unique():
-                    feeder_score = 20 if not outflow.empty else 15
+                    # All 241 previous false negatives had cashout corroboration
+                    # (were scoring 20, none scored 15) -- only raising THIS
+                    # branch above threshold targets them without touching the
+                    # noisier no-cashout population that caused false positives
+                    # when both were raised together.
+                    feeder_score = 32 if not outflow.empty else 15
                     flags[feeder]["score"] = max(flags[feeder]["score"], feeder_score)
                     flags[feeder]["reasons"].append(
                         f"fan_in_aggregation: one of {n_senders} accounts feeding a common recipient within {window_minutes}min"
