@@ -113,38 +113,73 @@ def detect_fan_out(G, txns, window_minutes=300, min_recipients=4):
     return flags
 
 
-def detect_fan_in(G, txns, window_minutes=400, min_senders=4, cashout_window_hours=6):
-    """Many accounts send to one recipient, which then empties out fast."""
+def detect_fan_in(G, txns, window_minutes=400, min_senders=4, cashout_window_hours=6,
+                   spike_multiplier=4.0):
+    """Many accounts send to one recipient, which then empties out fast.
+
+    RELATIVE BASELINE (not just a fixed count): before scoring, each
+    candidate is compared against that SAME account's own historical rate
+    of receiving from distinct senders. A marketplace naturally receiving
+    from many different buyers has a high baseline -- 6 senders in a few
+    hours is normal for it. A genuine fraud aggregator is usually a
+    previously-quiet account -- the same 6 senders is a massive spike
+    relative to its near-zero baseline. Only flag when the observed rate
+    is a large multiple (spike_multiplier) of the account's own baseline,
+    not just an absolute count. This is what makes the detector
+    self-calibrating instead of using one fixed number for every account
+    regardless of its normal traffic level.
+    """
     flags = defaultdict(lambda: {"score": 0, "reasons": []})
     in_txns = txns.sort_values("timestamp")
+
+    # Baseline: for every account, its historical distinct-sender rate
+    # (senders per day, averaged over the full observation span in the data).
+    span_days = max(1, (txns["timestamp"].max() - txns["timestamp"].min()).days)
+    baseline_senders_per_day = (
+        in_txns.groupby("dst_account")["src_account"].nunique() / span_days
+    )
+
     for dst, grp in in_txns.groupby("dst_account"):
         grp = grp.sort_values("timestamp")
         times = grp["timestamp"].values
+        baseline_rate = baseline_senders_per_day.get(dst, 0)
         for i in range(len(grp)):
             window = grp[(grp["timestamp"] >= times[i]) &
                          (grp["timestamp"] <= times[i] + np.timedelta64(window_minutes, "m"))]
             n_senders = window["src_account"].nunique()
             if n_senders >= min_senders:
-                # check for rapid cash-out after aggregation
+                # Relative check: is this a real spike above baseline, or
+                # just normal traffic for a naturally busy account?
+                window_days = window_minutes / (60 * 24)
+                expected_in_window = max(0.5, baseline_rate * window_days)  # floor avoids div-by-near-zero blowup
+                spike_ratio = n_senders / expected_in_window
+                if spike_ratio < spike_multiplier:
+                    continue  # not anomalous relative to this account's own normal behavior
+
                 inflow_end = window["timestamp"].max()
                 outflow = txns[(txns["src_account"] == dst) &
                                 (txns["timestamp"] > inflow_end) &
                                 (txns["timestamp"] <= inflow_end + pd.Timedelta(hours=cashout_window_hours))]
-                score = min(35, n_senders * 3)
-                reason = f"fan_in_aggregation: received from {n_senders} accounts within {window_minutes}min"
+                # Cashout is the PRIMARY gate for aggregator-side scoring, not
+                # just a bonus. Sender-count spikes alone have too much
+                # natural variance (a legitimate high-volume account's daily
+                # arrivals are Poisson-distributed and will occasionally spike
+                # 5-6x its own average by chance) to be trustworthy on their
+                # own. Rapid cash-out afterward is what actually distinguishes
+                # a fraud aggregator from a business that settles later/partially.
                 if not outflow.empty:
-                    score += 20
-                    reason += "; followed by rapid outbound cash-out"
+                    score = min(35, n_senders * 3) + 20
+                    reason = (f"fan_in_aggregation: received from {n_senders} accounts within "
+                              f"{window_minutes}min ({spike_ratio:.1f}x its own baseline rate); "
+                              f"followed by rapid outbound cash-out")
+                else:
+                    score = min(10, n_senders)  # weak signal alone, not enough to cross threshold by itself
+                    reason = (f"fan_in_aggregation: received from {n_senders} accounts within "
+                              f"{window_minutes}min ({spike_ratio:.1f}x its own baseline rate); "
+                              f"no rapid cash-out observed")
                 flags[dst]["score"] = max(flags[dst]["score"], score)
                 flags[dst]["reasons"].append(reason)
-                # feeder accounts are lower-confidence individually (could be
-                # coincidental) but still worth a moderate flag for review
                 for feeder in window["src_account"].unique():
-                    # All 241 previous false negatives had cashout corroboration
-                    # (were scoring 20, none scored 15) -- only raising THIS
-                    # branch above threshold targets them without touching the
-                    # noisier no-cashout population that caused false positives
-                    # when both were raised together.
                     feeder_score = 32 if not outflow.empty else 15
                     flags[feeder]["score"] = max(flags[feeder]["score"], feeder_score)
                     flags[feeder]["reasons"].append(
@@ -154,14 +189,35 @@ def detect_fan_in(G, txns, window_minutes=400, min_senders=4, cashout_window_hou
     return flags
 
 
-def detect_rapid_passthrough(G, txns, max_gap_hours=2, min_ratio=0.85):
-    """Account receives a large sum and forwards most of it out within hours."""
+def detect_rapid_passthrough(G, txns, max_gap_hours=2, min_ratio=0.85, size_multiplier=3.0):
+    """Account receives a large sum and forwards most of it out within hours.
+
+    RELATIVE SIZE CHECK: a busy account processing many small transactions
+    will, by pure chance, occasionally have an unrelated in/out pair within
+    the time window that happens to satisfy a loose amount-ratio match --
+    that's noise, not pass-through fraud. Genuine pass-through involves an
+    unusually LARGE lump sum relative to that account's own normal
+    transaction size. Requiring the incoming amount to be a multiple of the
+    account's own median transaction size filters out routine coincidences
+    (a marketplace's typical $15-250 purchases) while still catching real
+    fraud (thousands of dollars moving through an otherwise-quiet account).
+    """
     flags = defaultdict(lambda: {"score": 0, "reasons": []})
+    # Each account's own typical transaction size, across in+out activity
+    all_amounts_by_account = defaultdict(list)
+    for _, r in txns.iterrows():
+        all_amounts_by_account[r["src_account"]].append(r["amount"])
+        all_amounts_by_account[r["dst_account"]].append(r["amount"])
+    median_amount = {acct: pd.Series(amts).median() for acct, amts in all_amounts_by_account.items()}
+
     for acct, grp in txns.groupby("dst_account"):
         acct_out = txns[txns["src_account"] == acct]
         if acct_out.empty:
             continue
+        baseline = median_amount.get(acct, 0) or 1  # avoid div-by-zero
         for _, in_row in grp.iterrows():
+            if in_row["amount"] < baseline * size_multiplier:
+                continue  # not unusually large for this account -- likely routine activity, skip
             candidates = acct_out[
                 (acct_out["timestamp"] > in_row["timestamp"]) &
                 (acct_out["timestamp"] <= in_row["timestamp"] + pd.Timedelta(hours=max_gap_hours))
@@ -170,8 +226,8 @@ def detect_rapid_passthrough(G, txns, max_gap_hours=2, min_ratio=0.85):
                 if in_row["amount"] > 0 and out_row["amount"] / in_row["amount"] >= min_ratio:
                     flags[acct]["score"] = max(flags[acct]["score"], 45)
                     flags[acct]["reasons"].append(
-                        f"rapid_passthrough: received {in_row['amount']:.0f}, forwarded "
-                        f"{out_row['amount']:.0f} within {max_gap_hours}h"
+                        f"rapid_passthrough: received {in_row['amount']:.0f} ({in_row['amount']/baseline:.1f}x "
+                        f"its own typical transaction size), forwarded {out_row['amount']:.0f} within {max_gap_hours}h"
                     )
     return flags
 
@@ -234,12 +290,34 @@ def detect_layering_chains(G, min_chain_length=3, max_hop_hours=2, max_starts_pe
 # ---------------------------------------------------------------------------
 # 3. Combine signals into a single risk score per account
 # ---------------------------------------------------------------------------
-def combine_scores(*flag_dicts):
-    combined = defaultdict(lambda: {"risk_score": 0, "reasons": []})
+def combine_scores(*flag_dicts, corroboration_weight=0.2):
+    """Combines scores from independent detectors.
+
+    NOT pure summation (the old approach): the strongest single detector
+    score counts fully as the PRIMARY signal; every additional detector's
+    score only counts at corroboration_weight (default 40%). This reflects
+    a real distinction -- two weak, independent, possibly-coincidental
+    signals (e.g. a loose amount-ratio match plus a borderline recipient
+    count) should NOT sum to equal one strong, confirmed pattern (e.g. a
+    fan-in aggregator with an actual rapid cash-out). Pure summation let
+    accounts get flagged purely by accumulating multiple weak coincidences
+    across unrelated detectors -- this is what wrongly flagged legitimate
+    high-volume businesses in testing.
+    """
+    per_account_detector_scores = defaultdict(list)
+    per_account_reasons = defaultdict(list)
     for flags in flag_dicts:
         for acct, info in flags.items():
-            combined[acct]["risk_score"] = min(100, combined[acct]["risk_score"] + info["score"])
-            combined[acct]["reasons"].extend(info["reasons"])
+            per_account_detector_scores[acct].append(info["score"])
+            per_account_reasons[acct].extend(info["reasons"])
+
+    combined = defaultdict(lambda: {"risk_score": 0, "reasons": []})
+    for acct, scores in per_account_detector_scores.items():
+        scores_sorted = sorted(scores, reverse=True)
+        primary = scores_sorted[0]
+        corroboration = sum(scores_sorted[1:]) * corroboration_weight
+        combined[acct]["risk_score"] = min(100, round(primary + corroboration))
+        combined[acct]["reasons"] = per_account_reasons[acct]
     return combined
 
 
