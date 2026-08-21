@@ -290,7 +290,7 @@ def detect_layering_chains(G, min_chain_length=3, max_hop_hours=2, max_starts_pe
 # ---------------------------------------------------------------------------
 # 3. Combine signals into a single risk score per account
 # ---------------------------------------------------------------------------
-def combine_scores(*flag_dicts, corroboration_weight=0.2):
+def combine_scores(*flag_dicts, corroboration_weight=0.6):
     """Combines scores from independent detectors.
 
     NOT pure summation (the old approach): the strongest single detector
