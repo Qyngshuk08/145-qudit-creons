@@ -4,9 +4,20 @@ import './App.css'
 const API_BASE = 'http://127.0.0.1:8000'
 
 function riskColor(score) {
-  if (score >= 70) return '#dc2626'
-  if (score >= 40) return '#f59e0b'
-  return '#65a30d'
+  if (score >= 70) return '#e5484d'  // critical
+  if (score >= 40) return '#f5a524'  // high
+  return '#e6c229'  // medium
+}
+
+function RiskMeter({ score }) {
+  return (
+    <div className="risk-meter">
+      <div className="risk-meter-bar">
+        <div className="risk-meter-fill" style={{ width: `${score}%`, background: riskColor(score) }} />
+      </div>
+      <span className="risk-score" style={{ color: riskColor(score) }}>{score}</span>
+    </div>
+  )
 }
 
 function AccountList({ accounts, selectedId, onSelect, loading, error }) {
@@ -24,9 +35,7 @@ function AccountList({ accounts, selectedId, onSelect, loading, error }) {
         >
           <div className="account-row-top">
             <span className="account-id">{a.account_id}</span>
-            <span className="risk-badge" style={{ background: riskColor(a.risk_score) }}>
-              {a.risk_score}
-            </span>
+            <RiskMeter score={a.risk_score} />
           </div>
           <div className="account-patterns">
             {a.triggered_patterns.split(';').map((p) => (
@@ -37,6 +46,23 @@ function AccountList({ accounts, selectedId, onSelect, loading, error }) {
       ))}
     </div>
   )
+}
+
+function parseExplanation(text) {
+  // Splits "1. SEVERITY: HIGH 2. CASE SUMMARY: ... 3. RECOMMENDED ACTION: ..."
+  // into structured parts. Falls back to raw text if the model didn't follow
+  // the expected format -- never lose content, just lose the structure.
+  const severityMatch = text.match(/1\.\s*SEVERITY:\s*(CRITICAL|HIGH|MEDIUM)/i)
+  const summaryMatch = text.match(/2\.\s*CASE SUMMARY:\s*([\s\S]*?)(?=3\.\s*RECOMMENDED ACTION:|$)/i)
+  const actionMatch = text.match(/3\.\s*RECOMMENDED ACTION:\s*([\s\S]*)/i)
+
+  if (!severityMatch && !summaryMatch) return { severity: null, summary: text, action: null }
+
+  return {
+    severity: severityMatch ? severityMatch[1].toUpperCase() : null,
+    summary: summaryMatch ? summaryMatch[1].trim() : null,
+    action: actionMatch ? actionMatch[1].trim() : null,
+  }
 }
 
 function ExplainPanel({ accountId }) {
@@ -59,6 +85,8 @@ function ExplainPanel({ accountId }) {
       .catch((e) => setState({ status: 'error', text: e.message, source: null }))
   }
 
+  const parsed = state.status === 'done' ? parseExplanation(state.text) : null
+
   return (
     <div className="detail-section explain-section">
       <h3>
@@ -70,13 +98,24 @@ function ExplainPanel({ accountId }) {
         )}
       </h3>
       {state.status === 'idle' && (
-        <button className="explain-button" onClick={fetchExplanation}>
+        <button className="explain-btn" onClick={fetchExplanation}>
           Generate explanation (Nemotron)
         </button>
       )}
-      {state.status === 'loading' && <p className="evidence-text loading">Generating narrative...</p>}
-      {state.status === 'error' && <p className="evidence-text error-text">{state.text}</p>}
-      {state.status === 'done' && <p className="evidence-text explanation-text">{state.text}</p>}
+      {state.status === 'loading' && <p className="evidence-text">Generating narrative...</p>}
+      {state.status === 'error' && <p className="evidence-text" style={{ color: 'var(--critical)' }}>{state.text}</p>}
+      {state.status === 'done' && (
+        <div className="explanation-block">
+          {parsed.severity && (
+            <span className={`severity-badge ${parsed.severity.toLowerCase()}`}>{parsed.severity}</span>
+          )}
+          <div className="explanation-body">
+            {parsed.summary && <><strong>Case Summary</strong>{parsed.summary}</>}
+            {parsed.action && <><strong>Recommended Action</strong>{parsed.action}</>}
+            {!parsed.summary && !parsed.action && parsed.summary === null && state.text}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -109,9 +148,7 @@ function AccountDetail({ accountId }) {
     <div className="detail-panel">
       <div className="detail-header">
         <h2>{detail.account_id}</h2>
-        <span className="risk-badge large" style={{ background: riskColor(detail.risk_score) }}>
-          Risk: {detail.risk_score}
-        </span>
+        <RiskMeter score={detail.risk_score} />
       </div>
 
       <div className="detail-section">

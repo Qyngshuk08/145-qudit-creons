@@ -92,6 +92,12 @@ def detect_fan_out(G, txns, window_minutes=300, min_recipients=4):
     the source of a fan-out is typically an already-compromised account
     (often external / not in our scored universe), while the recipients are
     the accounts an investigator actually needs to act on.
+
+    CONTINUOUS SCORING: driven by both recipient count AND burst tightness
+    (actual elapsed time vs. the max allowed window) -- 8 recipients paid
+    out in 20 minutes is more suspicious than 8 paid out over the full
+    300-minute window, and the score should reflect that instead of only
+    caring whether the count crossed a fixed line.
     """
     flags = defaultdict(lambda: {"score": 0, "reasons": []})
     out_txns = txns.sort_values("timestamp")
@@ -103,11 +109,14 @@ def detect_fan_out(G, txns, window_minutes=300, min_recipients=4):
                          (grp["timestamp"] <= times[i] + np.timedelta64(window_minutes, "m"))]
             recipients = window["dst_account"].unique()
             if len(recipients) >= min_recipients:
+                elapsed_minutes = max(1, (window["timestamp"].max() - window["timestamp"].min()).total_seconds() / 60)
+                tightness_bonus = max(0, (window_minutes - elapsed_minutes) / window_minutes) * 15
+                score = min(50, len(recipients) * 4 + tightness_bonus)
                 for r in recipients:
-                    flags[r]["score"] = max(flags[r]["score"], min(40, len(recipients) * 4))
+                    flags[r]["score"] = max(flags[r]["score"], score)
                     flags[r]["reasons"].append(
                         f"fan_out_smurfing: received funds as one of {len(recipients)} rapid "
-                        f"recipients from a single source within {window_minutes}min"
+                        f"recipients from a single source within {elapsed_minutes:.0f}min"
                     )
                 break
     return flags
@@ -168,12 +177,12 @@ def detect_fan_in(G, txns, window_minutes=400, min_senders=4, cashout_window_hou
                 # own. Rapid cash-out afterward is what actually distinguishes
                 # a fraud aggregator from a business that settles later/partially.
                 if not outflow.empty:
-                    score = min(35, n_senders * 3) + 20
+                    score = min(45, 15 + spike_ratio * 2.5) + 20
                     reason = (f"fan_in_aggregation: received from {n_senders} accounts within "
                               f"{window_minutes}min ({spike_ratio:.1f}x its own baseline rate); "
                               f"followed by rapid outbound cash-out")
                 else:
-                    score = min(10, n_senders)  # weak signal alone, not enough to cross threshold by itself
+                    score = min(15, 5 + spike_ratio)  # weak signal alone, not enough to cross threshold by itself
                     reason = (f"fan_in_aggregation: received from {n_senders} accounts within "
                               f"{window_minutes}min ({spike_ratio:.1f}x its own baseline rate); "
                               f"no rapid cash-out observed")
@@ -224,9 +233,11 @@ def detect_rapid_passthrough(G, txns, max_gap_hours=2, min_ratio=0.85, size_mult
             ]
             for _, out_row in candidates.iterrows():
                 if in_row["amount"] > 0 and out_row["amount"] / in_row["amount"] >= min_ratio:
-                    flags[acct]["score"] = max(flags[acct]["score"], 45)
+                    size_ratio = in_row["amount"] / baseline
+                    score = min(50, 20 + size_ratio * 0.3)
+                    flags[acct]["score"] = max(flags[acct]["score"], score)
                     flags[acct]["reasons"].append(
-                        f"rapid_passthrough: received {in_row['amount']:.0f} ({in_row['amount']/baseline:.1f}x "
+                        f"rapid_passthrough: received {in_row['amount']:.0f} ({size_ratio:.1f}x "
                         f"its own typical transaction size), forwarded {out_row['amount']:.0f} within {max_gap_hours}h"
                     )
     return flags
@@ -279,8 +290,9 @@ def detect_layering_chains(G, min_chain_length=3, max_hop_hours=2, max_starts_pe
             dfs([node, first_dst], first_data["timestamp"], 1, budget=200)
 
     for chain in found_chains:
+        score = min(50, 30 + (len(chain) - min_chain_length) * 5)
         for acct in chain:
-            flags[acct]["score"] = max(flags[acct]["score"], 30)
+            flags[acct]["score"] = max(flags[acct]["score"], score)
             flags[acct]["reasons"].append(
                 f"layering_chain: part of {len(chain)}-hop rapid P2P transfer chain"
             )
