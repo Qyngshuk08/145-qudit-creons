@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import './App.css'
 
-const API_BASE = 'http://127.0.0.1:8000'
+const API_BASE = 'http://80.225.235.192:8000'
 
 function riskColor(score) {
   if (score >= 70) return '#e5484d'  // critical
